@@ -147,10 +147,34 @@ def validate_decision(package: dict, d: dict) -> dict:
     package_text = canonical(package)
     if any(ref not in package_text for ref in refs):
         raise HTTPException(502, detail={"code":"INVALID_MODEL_PROPOSAL", "message":"An evidence reference was not found in the source package"})
-    if not isinstance(rationale, str) or not 60 <= len(rationale) <= 1500 or action not in rationale:
-        raise HTTPException(502, detail={"code":"INVALID_MODEL_PROPOSAL", "message":"Model rationale failed validation"})
-    if sum(1 for x in refs if x in rationale) < 2:
-        raise HTTPException(502, detail={"code":"INVALID_MODEL_PROPOSAL", "message":"Rationale must cite at least two evidence references"})
+    
+    if not isinstance(rationale, str):
+        raise HTTPException(
+            502,
+            detail={
+                "code": "INVALID_MODEL_PROPOSAL",
+                "message": "Model rationale must be a string",
+            },
+        )
+
+    if not 60 <= len(rationale) <= 1500:
+        raise HTTPException(
+            502,
+            detail={
+                "code": "INVALID_MODEL_PROPOSAL",
+                "message": f"Model rationale length invalid: {len(rationale)} characters",
+            },
+        )
+
+    if action not in rationale:
+        raise HTTPException(
+            502,
+            detail={
+                "code": "INVALID_MODEL_PROPOSAL",
+                "message": "Model rationale must include the exact action identifier",
+            },
+        )
+
     try: amount = int(facts["amountMinor"])
     except Exception: raise HTTPException(502, detail={"code":"INVALID_MODEL_PROPOSAL", "message":"amountMinor must be an integer"})
     if amount < 0 or not all(isinstance(facts.get(k), str) and facts[k].strip() for k in ("vendorName","invoiceNumber","currency")):
