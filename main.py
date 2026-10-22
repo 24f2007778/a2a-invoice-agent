@@ -229,8 +229,10 @@ hold_invoice (pause until a named verification completes),
 reject_duplicate (the same commercial invoice was already paid; different invoice numbers are not duplicates),
 open_exception (material records conflict).
 
-Return JSON only in this format:
-{"decisions":[{"packageId":string,"action":string,"facts":{"vendorName":string,"invoiceNumber":string,"amountMinor":integer,"currency":string},"evidenceRefs":[exactly three decisive bracketed references],"rationale":string}]}
+Return JSON only in this format, with exactly one decision for every input package and no extra decisions:
+{"decisions":[{"packageId":string,"action":string,"facts":{"vendorName":string,"invoiceNumber":string,"amountMinor":integer,"currency":string},"evidenceRefs":["[REF-1]","[REF-2]","[REF-3]"],"rationale":string}]}
+
+EVIDENCE RULES: evidenceRefs must be an array of exactly THREE distinct strings. Each string must be copied verbatim from a decisive reference in the single paragraph that determines the action. Preserve the square brackets and spelling exactly. Do not return a citation without brackets, do not return fewer or more than three refs, and do not use cover-sheet, archive, training, or decoy references. The packageId must exactly match the input packageId.
 
 STRICT RATIONALE REQUIREMENTS:
 1. Each rationale must be between 60 and 1500 characters.
@@ -278,9 +280,24 @@ Preserve exact reference spelling. amountMinor is integer minor currency units (
                     },
                 )
 
+            if response.status_code == 429:
+                retry_after = response.headers.get("retry-after", "")
+                logger.warning(
+                    "LLM provider rate limited the batched decision request; retry_after=%s",
+                    retry_after or "unspecified",
+                )
+                raise HTTPException(
+                    503,
+                    headers={"Retry-After": retry_after} if retry_after.isdigit() else None,
+                    detail={
+                        "code": "MODEL_RATE_LIMITED",
+                        "message": "The AI provider rate limit was reached. Retry the same request after the indicated delay.",
+                    },
+                )
+
             if response.status_code >= 400:
                 logger.error(
-                    "Groq API error: status=%s response=%s",
+                    "LLM API error: status=%s response=%s",
                     response.status_code,
                     response.text[:1000],
                 )
@@ -513,32 +530,39 @@ def build_proposals(batch: dict) -> dict:
     if uncached:
         policy_revision = str(batch.get("policyRevision", ""))
 
-        # Process each uncached package separately to avoid oversized Groq requests.
-        for pkg in uncached:
-            pid = pkg.get("packageId") or pkg.get("id")
-            generated = model_decisions([pkg], policy_revision)
+        # The assignment expects one batched model decision step. This avoids
+        # a burst of per-package requests and reduces repeated prompt overhead.
+        generated = model_decisions(uncached, policy_revision)
+        uncached_ids = {pkg.get("packageId") or pkg.get("id") for pkg in uncached}
+        missing = sorted(pid for pid in uncached_ids if pid not in generated)
+        if missing:
+            logger.warning("Model omitted package_ids=%s", missing)
+            raise HTTPException(
+                502,
+                detail={
+                    "code": "INVALID_MODEL_PROPOSAL",
+                    "message": "Model omitted one or more packages",
+                },
+            )
 
-            if pid not in generated:
-                logger.warning("Model omitted package_id=%s", pid)
-                raise HTTPException(
-                    502,
-                    detail={
-                        "code": "INVALID_MODEL_PROPOSAL",
-                        "message": "Model omitted a package",
-                    },
-                )
-
-            validated = validate_decision(pkg, generated[pid])
-            decisions[pid] = {
-                key: value
-                for key, value in validated.items()
-                if key != "packageId"
+        # Validate every proposal before writing any of this batch's decisions
+        # to cache, so a partial/invalid model response is never cached.
+        validated_decisions = {}
+        by_id = {pkg.get("packageId") or pkg.get("id"): pkg for pkg in uncached}
+        for pid in uncached_ids:
+            validated = validate_decision(by_id[pid], generated[pid])
+            validated_decisions[pid] = {
+                key: value for key, value in validated.items() if key != "packageId"
             }
 
+        decisions.update(validated_decisions)
         with engine.begin() as c:
             for pid, pkg in zip(ids, packages):
-                if pid in decisions:
-                    c.execute(text("INSERT INTO decision_cache(package_hash,decision_json,created_at) VALUES(:h,:d,:ts) ON CONFLICT(package_hash) DO NOTHING"), {"h":cache_hashes[pid],"d":canonical(decisions[pid]),"ts":now()})
+                if pid in validated_decisions:
+                    c.execute(
+                        text("INSERT INTO decision_cache(package_hash,decision_json,created_at) VALUES(:h,:d,:ts) ON CONFLICT(package_hash) DO NOTHING"),
+                        {"h": cache_hashes[pid], "d": canonical(decisions[pid]), "ts": now()},
+                    )
     proposals = []
     for pid in ids:
         d = decisions[pid]
