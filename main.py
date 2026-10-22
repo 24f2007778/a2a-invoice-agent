@@ -9,7 +9,10 @@ from fastapi import FastAPI, Request, Header, HTTPException, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
+import logging
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("invoice_agent")
 APP_NAME = "Invoice Action Agent"
 VERSION = "1.0.0"
 BASE_URL = os.getenv("A2A_BASE_URL", "https://your-service.onrender.com/a2a/")
@@ -29,6 +32,61 @@ ACTIONS = {"settle_invoice", "request_approval", "hold_invoice", "reject_duplica
 TERMINAL = {"TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED", "TASK_STATE_REJECTED"}
 
 app = FastAPI(title=APP_NAME, version=VERSION)
+
+@app.middleware("http")
+async def log_request_details(request: Request, call_next):
+    request_id = request.headers.get("x-request-id", "not-provided")
+
+    # Log safe request metadata, not all headers
+    logger.info(
+        "INCOMING REQUEST method=%s path=%s request_id=%s "
+        "content_type=%s content_length=%s a2a_version=%s",
+        request.method,
+        request.url.path,
+        request_id,
+        request.headers.get("content-type"),
+        request.headers.get("content-length"),
+        request.headers.get("a2a-version"),
+    )
+
+    # Capture the body for diagnostics
+    body = await request.body()
+
+    if body:
+        try:
+            parsed_body = json.loads(body)
+            if isinstance(parsed_body, dict):
+                # Avoid logging invoice content or other potentially sensitive data
+                safe_body = {
+                    "top_level_keys": list(parsed_body.keys()),
+                    "has_message": "message" in parsed_body,
+                }
+            else:
+                safe_body = {"body_type": type(parsed_body).__name__}
+
+            logger.info(
+                "REQUEST BODY SUMMARY request_id=%s details=%s",
+                request_id,
+                safe_body,
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.info(
+                "REQUEST BODY request_id=%s body_length=%s non_json=true",
+                request_id,
+                len(body),
+            )
+
+    response = await call_next(request)
+
+    logger.info(
+        "OUTGOING RESPONSE method=%s path=%s status=%s request_id=%s",
+        request.method,
+        request.url.path,
+        response.status_code,
+        request_id,
+    )
+
+    return response
 
 def canonical(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -151,9 +209,16 @@ Preserve exact reference spelling. amountMinor is integer minor currency units (
         return out
     except HTTPException:
         raise
-    except Exception as e:
-        # Do not echo provider errors or invoice content to callers.
-        raise HTTPException(502, detail={"code":"MODEL_FAILURE", "message":"Invoice analysis failed; retry with the same message ID"})
+    except Exception:
+        logger.exception("Model analysis failed")
+        raise HTTPException(
+            502,
+            detail={
+                "code": "MODEL_FAILURE",
+                "message": "Invoice analysis failed; retry with the same message ID"
+            }
+        )
+
 
 def validate_decision(package: dict, d: dict) -> dict:
     pid = package.get("packageId") or package.get("id")
@@ -161,14 +226,57 @@ def validate_decision(package: dict, d: dict) -> dict:
     facts = d.get("facts") if isinstance(d.get("facts"), dict) else {}
     refs = d.get("evidenceRefs")
     rationale = d.get("rationale")
-    # No unsupported action or weak citation set is allowed to pass through.
-    if action not in ACTIONS or not isinstance(refs, list) or len(refs) != 3 or len(set(refs)) != 3 or not all(isinstance(x, str) and len(x) >= 3 and x.startswith("[") and x.endswith("]") for x in refs):
-        raise HTTPException(502, detail={"code":"INVALID_MODEL_PROPOSAL", "message":"Model output failed proposal validation"})
+
+    # 1. Validate action and evidence reference structure
+    if (
+        action not in ACTIONS
+        or not isinstance(refs, list)
+        or len(refs) != 3
+        or not all(isinstance(x, str) for x in refs)
+        or len(set(refs)) != 3
+        or not all(
+            len(x) >= 3 and x.startswith("[") and x.endswith("]")
+            for x in refs
+        )
+    ):
+        logger.warning(
+            "Proposal validation failed: package_id=%s, "
+            "reason=invalid_action_or_refs, action=%s",
+            pid,
+            action,
+        )
+        raise HTTPException(
+            502,
+            detail={
+                "code": "INVALID_MODEL_PROPOSAL",
+                "message": "Model output failed proposal validation",
+            },
+        )
+
+    # 2. Ensure every evidence reference exists in the source package
     package_text = canonical(package)
+
     if any(ref not in package_text for ref in refs):
-        raise HTTPException(502, detail={"code":"INVALID_MODEL_PROPOSAL", "message":"An evidence reference was not found in the source package"})
-    
+        logger.warning(
+            "Proposal validation failed: package_id=%s, "
+            "reason=missing_evidence_reference",
+            pid,
+        )
+        raise HTTPException(
+            502,
+            detail={
+                "code": "INVALID_MODEL_PROPOSAL",
+                "message": "An evidence reference was not found in the source package",
+            },
+        )
+
+    # 3. Validate rationale type
     if not isinstance(rationale, str):
+        logger.warning(
+            "Proposal validation failed: package_id=%s, "
+            "reason=rationale_not_string",
+            pid,
+        )
         raise HTTPException(
             502,
             detail={
@@ -177,16 +285,30 @@ def validate_decision(package: dict, d: dict) -> dict:
             },
         )
 
+    # 4. Validate rationale length
     if not 60 <= len(rationale) <= 1500:
+        logger.warning(
+            "Proposal validation failed: package_id=%s, "
+            "reason=invalid_rationale_length, length=%s",
+            pid,
+            len(rationale),
+        )
         raise HTTPException(
             502,
             detail={
                 "code": "INVALID_MODEL_PROPOSAL",
-                "message": f"Model rationale length invalid: {len(rationale)} characters",
+                "message": "Model rationale length must be 60-1500 characters",
             },
         )
 
+    # 5. Require the exact action identifier
     if action not in rationale:
+        logger.warning(
+            "Proposal validation failed: package_id=%s, "
+            "reason=action_identifier_missing, action=%s",
+            pid,
+            action,
+        )
         raise HTTPException(
             502,
             detail={
@@ -195,11 +317,95 @@ def validate_decision(package: dict, d: dict) -> dict:
             },
         )
 
-    try: amount = int(facts["amountMinor"])
-    except Exception: raise HTTPException(502, detail={"code":"INVALID_MODEL_PROPOSAL", "message":"amountMinor must be an integer"})
-    if amount < 0 or not all(isinstance(facts.get(k), str) and facts[k].strip() for k in ("vendorName","invoiceNumber","currency")):
-        raise HTTPException(502, detail={"code":"INVALID_MODEL_PROPOSAL", "message":"Invoice facts are incomplete"})
-    return {"packageId": pid, "action": action, "facts":{"vendorName":facts["vendorName"],"invoiceNumber":facts["invoiceNumber"],"amountMinor":amount,"currency":facts["currency"]}, "evidenceRefs":refs, "rationale":rationale}
+    # 6. Require at least two exact evidence references in the rationale
+    cited_refs = sum(1 for ref in refs if ref in rationale)
+
+    if cited_refs < 2:
+        logger.warning(
+            "Proposal validation failed: package_id=%s, "
+            "reason=insufficient_evidence_citations, cited_count=%s",
+            pid,
+            cited_refs,
+        )
+        raise HTTPException(
+            502,
+            detail={
+                "code": "INVALID_MODEL_PROPOSAL",
+                "message": "Rationale must cite at least two evidence references",
+            },
+        )
+
+    # 7. Validate amountMinor
+    try:
+        amount = int(facts["amountMinor"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        logger.warning(
+            "Proposal validation failed: package_id=%s, "
+            "reason=invalid_amount_minor",
+            pid,
+        )
+        raise HTTPException(
+            502,
+            detail={
+                "code": "INVALID_MODEL_PROPOSAL",
+                "message": "amountMinor must be an integer",
+            },
+        )
+
+    if amount < 0:
+        logger.warning(
+            "Proposal validation failed: package_id=%s, "
+            "reason=negative_amount_minor",
+            pid,
+        )
+        raise HTTPException(
+            502,
+            detail={
+                "code": "INVALID_MODEL_PROPOSAL",
+                "message": "amountMinor must not be negative",
+            },
+        )
+
+    # 8. Validate required invoice facts
+    required_fields = ("vendorName", "invoiceNumber", "currency")
+
+    if not all(
+        isinstance(facts.get(key), str) and facts[key].strip()
+        for key in required_fields
+    ):
+        logger.warning(
+            "Proposal validation failed: package_id=%s, "
+            "reason=incomplete_invoice_facts",
+            pid,
+        )
+        raise HTTPException(
+            502,
+            detail={
+                "code": "INVALID_MODEL_PROPOSAL",
+                "message": "Invoice facts are incomplete",
+            },
+        )
+
+    # 9. Return the validated proposal
+    logger.info(
+        "Proposal validation succeeded: package_id=%s, action=%s",
+        pid,
+        action,
+    )
+
+    return {
+        "packageId": pid,
+        "action": action,
+        "facts": {
+            "vendorName": facts["vendorName"],
+            "invoiceNumber": facts["invoiceNumber"],
+            "amountMinor": amount,
+            "currency": facts["currency"],
+        },
+        "evidenceRefs": refs,
+        "rationale": rationale,
+    }
+
 
 def build_proposals(batch: dict) -> dict:
     packages = batch.get("packages")
