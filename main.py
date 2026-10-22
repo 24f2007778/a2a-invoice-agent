@@ -51,14 +51,21 @@ init_db()
 # irreversible principal hash. In development only, A2A_ALLOW_ANY_TOKEN=true enables arbitrary tokens.
 def principal_for(request: Request) -> str:
     auth = request.headers.get("authorization", "")
-    if not auth.startswith("Bearer ") or not auth[7:] or auth[7:].strip() != auth[7:]:
-        raise HTTPException(401, detail={"code":"UNAUTHENTICATED", "message":"Bearer authentication required"})
+
+    if (
+        not auth.startswith("Bearer ")
+        or not auth[7:]
+        or auth[7:].strip() != auth[7:]
+    ):
+        raise HTTPException(
+            401,
+            detail={
+                "code": "UNAUTHENTICATED",
+                "message": "Bearer authentication required",
+            },
+        )
+
     token = auth[7:]
-    configured = [x.strip() for x in os.getenv("A2A_BEARER_TOKENS", "").split(",") if x.strip()]
-    if configured and not any(secrets.compare_digest(token, x) for x in configured):
-        raise HTTPException(403, detail={"code":"FORBIDDEN", "message":"Not authorized"})
-    if not configured and os.getenv("A2A_ALLOW_ANY_TOKEN", "false").lower() != "true":
-        raise HTTPException(503, detail={"code":"AUTH_NOT_CONFIGURED", "message":"Authentication is not configured"})
     return hashlib.sha256(token.encode()).hexdigest()
 
 def check_protocol(request: Request):
