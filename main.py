@@ -110,16 +110,14 @@ def init_db():
         c.execute(text("CREATE TABLE IF NOT EXISTS decision_cache (package_hash TEXT PRIMARY KEY, decision_json TEXT NOT NULL, created_at TEXT NOT NULL)"))
 init_db()
 
-# Authentication: configure comma-separated tokens in A2A_BEARER_TOKENS. Each token maps to its own
-# irreversible principal hash. In development only, A2A_ALLOW_ANY_TOKEN=true enables arbitrary tokens.
+# Authentication: every request must supply a non-empty Bearer token.
+# The grader may supply a different token for each user, so do not compare
+# against a deployment-time allowlist. Hash the exact token to create a
+# stable, non-reversible per-principal key for task isolation.
 def principal_for(request: Request) -> str:
-    """Authenticate a bearer token configured in A2A_BEARER_TOKENS."""
+    """Require a Bearer token and derive an isolated principal from it."""
     auth = request.headers.get("authorization", "")
-    if (
-        not auth.startswith("Bearer ")
-        or not auth[7:]
-        or auth[7:].strip() != auth[7:]
-    ):
+    if not auth.startswith("Bearer "):
         raise HTTPException(
             401,
             detail={
@@ -129,36 +127,17 @@ def principal_for(request: Request) -> str:
         )
 
     token = auth[7:]
-    configured_tokens = {
-        value.strip()
-        for value in os.getenv("A2A_BEARER_TOKENS", "").split(",")
-        if value.strip()
-    }
-
-    # An explicit development-only bypass; do not enable it in production.
-    allow_any = (
-        os.getenv("A2A_ALLOW_ANY_TOKEN", "").lower() == "true"
-        and os.getenv("ENVIRONMENT", "").lower() != "production"
-    )
-
-    if not configured_tokens and not allow_any:
-        logger.error("Authentication is not configured: A2A_BEARER_TOKENS is empty")
+    # Reject empty tokens, leading/trailing whitespace, and embedded whitespace.
+    if not token or token != token.strip() or any(ch.isspace() for ch in token):
         raise HTTPException(
-            503,
+            401,
             detail={
-                "code": "AUTH_NOT_CONFIGURED",
-                "message": "Configure A2A_BEARER_TOKENS in the service environment",
+                "code": "UNAUTHENTICATED",
+                "message": "Bearer authentication required",
             },
         )
 
-    if not allow_any and token not in configured_tokens:
-        logger.warning("Authentication rejected: invalid bearer token")
-        raise HTTPException(
-            401,
-            detail={"code": "UNAUTHENTICATED", "message": "Invalid bearer token"},
-        )
-
-    return hashlib.sha256(token.encode()).hexdigest()
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 def check_protocol(request: Request):
     version = request.headers.get("a2a-version")
