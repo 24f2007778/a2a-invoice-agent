@@ -267,16 +267,41 @@ Preserve exact reference spelling. amountMinor is integer minor currency units (
             )
 
             if response.status_code == 413:
-                logger.error(
-                    "Groq rejected model request with HTTP 413. packages=%s; request_size_bytes=%s",
+                request_size = len(canonical(payload).encode("utf-8"))
+                logger.warning(
+                    "LLM provider rejected request with HTTP 413; packages=%s request_size_bytes=%s",
                     len(packages),
-                    len(canonical(payload).encode("utf-8")),
+                    request_size,
                 )
+                # Prefer one batched call as required by the assignment. If the
+                # provider rejects the batch at its HTTP payload limit, split it
+                # adaptively so the task can still complete. This fallback is
+                # only used after a confirmed 413; it is not used for normal
+                # requests and never drops or truncates invoice evidence.
+                if len(packages) > 1:
+                    midpoint = len(packages) // 2
+                    logger.warning(
+                        "Retrying oversized model batch as two smaller batches: left=%s right=%s",
+                        midpoint,
+                        len(packages) - midpoint,
+                    )
+                    left = model_decisions(packages[:midpoint], policy_revision)
+                    right = model_decisions(packages[midpoint:], policy_revision)
+                    overlap = set(left).intersection(right)
+                    if overlap:
+                        raise HTTPException(
+                            502,
+                            detail={
+                                "code": "INVALID_MODEL_RESPONSE",
+                                "message": "Model returned duplicate package decisions",
+                            },
+                        )
+                    return {**left, **right}
                 raise HTTPException(
                     413,
                     detail={
                         "code": "MODEL_REQUEST_TOO_LARGE",
-                        "message": "Groq rejected the model request as too large. Reduce the size of this invoice package or its evidence text.",
+                        "message": "The AI provider rejected a single invoice package as too large; reduce that package's document payload or use a provider with a larger request limit.",
                     },
                 )
 
