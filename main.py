@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, json, hashlib, secrets, uuid, time
+import asyncio, os, json, hashlib, secrets, uuid, time
 from datetime import datetime, timezone
 from typing import Any
 from contextlib import contextmanager
@@ -175,6 +175,21 @@ def get_task(task_id: str, principal: str, for_update: bool = False):
         if not row or row.principal != principal:
             raise HTTPException(404, detail={"code":"TASK_NOT_FOUND", "message":"Task not found"})
         return json.loads(row.task_json)
+
+async def wait_for_idempotent_task(task_id: str, principal: str):
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        with engine.begin() as c:
+            row = c.execute(
+                text("SELECT task_json,state FROM tasks WHERE id=:id AND principal=:p"),
+                {"id": task_id, "p": principal},
+            ).first()
+        if not row:
+            raise HTTPException(503, detail={"code":"REQUEST_IN_PROGRESS", "message":"Retry the same message"})
+        if row.state != "TASK_STATE_WORKING":
+            return JSONResponse({"task": json.loads(row.task_json)}, media_type=A2A_MT)
+        await asyncio.sleep(0.1)
+    raise HTTPException(503, detail={"code":"REQUEST_IN_PROGRESS", "message":"Retry the same message"})
 
 def persist_task(task: dict, principal: str, batch_id: str | None = None):
     ts = now()
@@ -656,13 +671,19 @@ async def send_message(request: Request):
     if message.get("role") != "ROLE_USER":
         raise HTTPException(400, detail={"code":"INVALID_MESSAGE", "message":"role must be ROLE_USER"})
     msg_hash = digest(message)  # configuration deliberately excluded
+    pending_task_id = None
     with engine.begin() as c:
         existing = c.execute(text("SELECT message_hash,task_id FROM idempotency WHERE principal=:p AND message_id=:m"), {"p":principal,"m":message["messageId"]}).first()
         if existing:
             if existing.message_hash != msg_hash:
                 raise HTTPException(409, detail={"code":"IDEMPOTENCY_CONFLICT", "message":"Message ID reused with different content"})
-            row = c.execute(text("SELECT task_json FROM tasks WHERE id=:id AND principal=:p"), {"id":existing.task_id,"p":principal}).first()
-            if row: return JSONResponse({"task":json.loads(row.task_json)}, media_type=A2A_MT)
+            row = c.execute(text("SELECT task_json,state FROM tasks WHERE id=:id AND principal=:p"), {"id":existing.task_id,"p":principal}).first()
+            if row and row.state == "TASK_STATE_WORKING":
+                pending_task_id = existing.task_id
+            elif row:
+                return JSONResponse({"task":json.loads(row.task_json)}, media_type=A2A_MT)
+    if pending_task_id:
+        return await wait_for_idempotent_task(pending_task_id, principal)
     # Initial batch vs result continuation are distinguished by typed media type.
     parts = message_parts(message)
     result_part = next((p for p in parts if p.get("mediaType") == RESULTS_MT and isinstance(p.get("data"),dict)), None)
@@ -705,21 +726,40 @@ async def send_message(request: Request):
     batch = get_data_part(message, BATCH_MT)
     if not isinstance(batch.get("batchId"),str) or not batch.get("batchId") or not isinstance(batch.get("policyRevision"),str):
         raise HTTPException(400, detail={"code":"INVALID_BATCH", "message":"batchId and policyRevision required"})
-    proposal_data = build_proposals(batch)
     task_id = uid("task-"); context_id = message.get("contextId") or uid("ctx-")
-    task = {"id":task_id,"contextId":context_id,"status":task_status("TASK_STATE_INPUT_REQUIRED"),"artifacts":[artifact(PROPOSALS_MT,proposal_data)],"history":[message]}
-    # Persist task and idempotency key in the same transaction before responding.
+    working_task = {"id":task_id,"contextId":context_id,"status":task_status("TASK_STATE_WORKING"),"artifacts":[],"history":[message]}
+    reserved = False
     with engine.begin() as c:
-        try:
-            c.execute(text("INSERT INTO tasks(id,principal,context_id,batch_id,state,task_json,created_at,updated_at) VALUES(:id,:p,:ctx,:batch,:state,:json,:ts,:ts)"), {"id":task_id,"p":principal,"ctx":context_id,"batch":batch["batchId"],"state":"TASK_STATE_INPUT_REQUIRED","json":canonical(task),"ts":now()})
-            c.execute(text("INSERT INTO idempotency(principal,message_id,message_hash,task_id,created_at) VALUES(:p,:m,:h,:id,:ts)"), {"p":principal,"m":message["messageId"],"h":msg_hash,"id":task_id,"ts":now()})
-        except IntegrityError:
-            row=c.execute(text("SELECT message_hash,task_id FROM idempotency WHERE principal=:p AND message_id=:m"), {"p":principal,"m":message["messageId"]}).first()
-            if row and row.message_hash != msg_hash: raise HTTPException(409, detail={"code":"IDEMPOTENCY_CONFLICT", "message":"Message ID reused with different content"})
+        c.execute(text("INSERT INTO tasks(id,principal,context_id,batch_id,state,task_json,created_at,updated_at) VALUES(:id,:p,:ctx,:batch,:state,:json,:ts,:ts)"), {"id":task_id,"p":principal,"ctx":context_id,"batch":batch["batchId"],"state":"TASK_STATE_WORKING","json":canonical(working_task),"ts":now()})
+        inserted = c.execute(text("INSERT INTO idempotency(principal,message_id,message_hash,task_id,created_at) VALUES(:p,:m,:h,:id,:ts) ON CONFLICT(principal,message_id) DO NOTHING"), {"p":principal,"m":message["messageId"],"h":msg_hash,"id":task_id,"ts":now()})
+        if inserted.rowcount == 1:
+            reserved = True
+        else:
+            c.execute(text("DELETE FROM tasks WHERE id=:id AND principal=:p"), {"id":task_id,"p":principal})
+            existing = c.execute(text("SELECT message_hash,task_id FROM idempotency WHERE principal=:p AND message_id=:m"), {"p":principal,"m":message["messageId"]}).first()
+            if not existing or existing.message_hash != msg_hash:
+                raise HTTPException(409, detail={"code":"IDEMPOTENCY_CONFLICT", "message":"Message ID reused with different content"})
+            pending_task_id = existing.task_id
+
+    if not reserved:
+        return await wait_for_idempotent_task(pending_task_id, principal)
+
+    try:
+        proposal_data = build_proposals(batch)
+    except Exception:
+        with engine.begin() as c:
+            c.execute(text("DELETE FROM idempotency WHERE principal=:p AND message_id=:m AND task_id=:id"), {"p":principal,"m":message["messageId"],"id":task_id})
+            c.execute(text("DELETE FROM tasks WHERE id=:id AND principal=:p AND state=:state"), {"id":task_id,"p":principal,"state":"TASK_STATE_WORKING"})
+        raise
+
+    task = {"id":task_id,"contextId":context_id,"status":task_status("TASK_STATE_INPUT_REQUIRED"),"artifacts":[artifact(PROPOSALS_MT,proposal_data)],"history":[message]}
+    with engine.begin() as c:
+        updated = c.execute(text("UPDATE tasks SET state=:state,task_json=:json,updated_at=:ts WHERE id=:id AND principal=:p AND state=:working"), {"state":"TASK_STATE_INPUT_REQUIRED","json":canonical(task),"ts":now(),"id":task_id,"p":principal,"working":"TASK_STATE_WORKING"})
+        if updated.rowcount != 1:
+            row = c.execute(text("SELECT task_json FROM tasks WHERE id=:id AND principal=:p"), {"id":task_id,"p":principal}).first()
             if row:
-                existing=c.execute(text("SELECT task_json FROM tasks WHERE id=:id AND principal=:p"), {"id":row.task_id,"p":principal}).first()
-                if existing: return JSONResponse({"task":json.loads(existing.task_json)},media_type=A2A_MT)
-            raise HTTPException(409, detail={"code":"IDEMPOTENCY_CONFLICT", "message":"Concurrent request conflict; retry same message"})
+                return JSONResponse({"task":json.loads(row.task_json)},media_type=A2A_MT)
+            raise HTTPException(503, detail={"code":"TASK_PERSISTENCE_FAILED", "message":"Task could not be stored"})
     return JSONResponse({"task":task}, media_type=A2A_MT)
 
 @app.get("/a2a/tasks/{task_id}")
