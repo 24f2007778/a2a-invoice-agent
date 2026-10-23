@@ -273,50 +273,32 @@ Preserve exact reference spelling. amountMinor is integer minor currency units (
                     len(packages),
                     request_size,
                 )
-                # Prefer one batched call as required by the assignment. If the
-                # provider rejects the batch at its HTTP payload limit, split it
-                # adaptively so the task can still complete. This fallback is
-                # only used after a confirmed 413; it is not used for normal
-                # requests and never drops or truncates invoice evidence.
-                if len(packages) > 1:
-                    midpoint = len(packages) // 2
-                    logger.warning(
-                        "Retrying oversized model batch as two smaller batches: left=%s right=%s",
-                        midpoint,
-                        len(packages) - midpoint,
-                    )
-                    left = model_decisions(packages[:midpoint], policy_revision)
-                    right = model_decisions(packages[midpoint:], policy_revision)
-                    overlap = set(left).intersection(right)
-                    if overlap:
-                        raise HTTPException(
-                            502,
-                            detail={
-                                "code": "INVALID_MODEL_RESPONSE",
-                                "message": "Model returned duplicate package decisions",
-                            },
-                        )
-                    return {**left, **right}
                 raise HTTPException(
                     413,
                     detail={
                         "code": "MODEL_REQUEST_TOO_LARGE",
-                        "message": "The AI provider rejected a single invoice package as too large; reduce that package's document payload or use a provider with a larger request limit.",
+                        "message": "The AI provider rejected this batch size.",
                     },
                 )
 
             if response.status_code == 429:
                 retry_after = response.headers.get("retry-after", "")
                 logger.warning(
-                    "LLM provider rate limited the batched decision request; retry_after=%s",
+                    "LLM provider rate limited the decision request; package_count=%s retry_after=%s",
+                    len(packages),
                     retry_after or "unspecified",
                 )
+                # Do not sleep inside the grader's 45-second request window.
+                # Return a retryable response and preserve the same message ID
+                # on the caller's retry. Already cached semantic decisions are
+                # reused by build_proposals.
+                headers = {"Retry-After": retry_after} if retry_after.isdigit() else None
                 raise HTTPException(
                     503,
-                    headers={"Retry-After": retry_after} if retry_after.isdigit() else None,
+                    headers=headers,
                     detail={
                         "code": "MODEL_RATE_LIMITED",
-                        "message": "The AI provider rate limit was reached. Retry the same request after the indicated delay.",
+                        "message": "The AI provider rate limit was reached. Retry after the indicated delay, or configure a model/provider with a higher token-per-minute limit.",
                     },
                 )
 
@@ -544,56 +526,92 @@ def build_proposals(batch: dict) -> dict:
     ids = [p.get("packageId") or p.get("id") for p in packages if isinstance(p, dict)]
     if len(ids) != len(packages) or any(not isinstance(x, str) or not x for x in ids) or len(set(ids)) != len(ids):
         raise HTTPException(400, detail={"code":"INVALID_BATCH", "message":"Package IDs must be present and unique"})
-    cache_hashes = {pid: digest(pkg) for pid,pkg in zip(ids, packages)}
-    decisions = {}
-    uncached = []
+
+    cache_hashes = {pid: digest(pkg) for pid, pkg in zip(ids, packages)}
+    decisions: dict[str, dict] = {}
+    uncached: list[dict] = []
     with engine.begin() as c:
         for pid, pkg in zip(ids, packages):
-            row = c.execute(text("SELECT decision_json FROM decision_cache WHERE package_hash=:h"), {"h":cache_hashes[pid]}).first()
-            if row: decisions[pid] = json.loads(row.decision_json)
-            else: uncached.append(pkg)
-    if uncached:
-        policy_revision = str(batch.get("policyRevision", ""))
+            row = c.execute(
+                text("SELECT decision_json FROM decision_cache WHERE package_hash=:h"),
+                {"h": cache_hashes[pid]},
+            ).first()
+            if row:
+                decisions[pid] = json.loads(row.decision_json)
+            else:
+                uncached.append(pkg)
 
-        # The assignment expects one batched model decision step. This avoids
-        # a burst of per-package requests and reduces repeated prompt overhead.
-        generated = model_decisions(uncached, policy_revision)
-        uncached_ids = {pkg.get("packageId") or pkg.get("id") for pkg in uncached}
-        missing = sorted(pid for pid in uncached_ids if pid not in generated)
-        if missing:
-            logger.warning("Model omitted package_ids=%s", missing)
+    policy_revision = str(batch.get("policyRevision", ""))
+
+    def analyze_and_cache(chunk: list[dict]) -> None:
+        if not chunk:
+            return
+        try:
+            generated = model_decisions(chunk, policy_revision)
+        except HTTPException as exc:
+            # Split only after a confirmed provider payload-size rejection.
+            # Cache each successful sub-batch independently, so a later 429
+            # does not force completed model work to be repeated on retry.
+            if exc.status_code == 413 and len(chunk) > 1:
+                midpoint = len(chunk) // 2
+                logger.warning(
+                    "Splitting oversized batch: left=%s right=%s",
+                    midpoint,
+                    len(chunk) - midpoint,
+                )
+                analyze_and_cache(chunk[:midpoint])
+                analyze_and_cache(chunk[midpoint:])
+                return
+            raise
+
+        chunk_ids = [pkg.get("packageId") or pkg.get("id") for pkg in chunk]
+        missing = sorted(pid for pid in chunk_ids if pid not in generated)
+        extra = sorted(set(generated) - set(chunk_ids))
+        if missing or extra:
+            logger.warning("Model decision set mismatch: missing=%s extra=%s", missing, extra)
             raise HTTPException(
                 502,
                 detail={
                     "code": "INVALID_MODEL_PROPOSAL",
-                    "message": "Model omitted one or more packages",
+                    "message": "Model must return exactly one decision for each package in the batch",
                 },
             )
 
-        # Validate every proposal before writing any of this batch's decisions
-        # to cache, so a partial/invalid model response is never cached.
-        validated_decisions = {}
-        by_id = {pkg.get("packageId") or pkg.get("id"): pkg for pkg in uncached}
-        for pid in uncached_ids:
+        validated_chunk: dict[str, dict] = {}
+        by_id = {pkg.get("packageId") or pkg.get("id"): pkg for pkg in chunk}
+        for pid in chunk_ids:
             validated = validate_decision(by_id[pid], generated[pid])
-            validated_decisions[pid] = {
+            validated_chunk[pid] = {
                 key: value for key, value in validated.items() if key != "packageId"
             }
 
-        decisions.update(validated_decisions)
+        # Persist only fully validated decisions from this chunk.
         with engine.begin() as c:
-            for pid, pkg in zip(ids, packages):
-                if pid in validated_decisions:
-                    c.execute(
-                        text("INSERT INTO decision_cache(package_hash,decision_json,created_at) VALUES(:h,:d,:ts) ON CONFLICT(package_hash) DO NOTHING"),
-                        {"h": cache_hashes[pid], "d": canonical(decisions[pid]), "ts": now()},
-                    )
+            for pid in chunk_ids:
+                c.execute(
+                    text("INSERT INTO decision_cache(package_hash,decision_json,created_at) VALUES(:h,:d,:ts) ON CONFLICT(package_hash) DO NOTHING"),
+                    {
+                        "h": cache_hashes[pid],
+                        "d": canonical(validated_chunk[pid]),
+                        "ts": now(),
+                    },
+                )
+        decisions.update(validated_chunk)
+
+    analyze_and_cache(uncached)
+
     proposals = []
     for pid in ids:
         d = decisions[pid]
-        # Cache is semantic; action IDs remain unique to this task/batch namespace.
-        proposals.append({"packageId":pid,"actionId":uid("act-"),"action":d["action"],"facts":d["facts"],"evidenceRefs":d["evidenceRefs"],"rationale":d["rationale"]})
-    return {"batchId":batch.get("batchId"),"proposals":proposals}
+        proposals.append({
+            "packageId": pid,
+            "actionId": uid("act-"),
+            "action": d["action"],
+            "facts": d["facts"],
+            "evidenceRefs": d["evidenceRefs"],
+            "rationale": d["rationale"],
+        })
+    return {"batchId": batch.get("batchId"), "proposals": proposals}
 
 @app.get("/.well-known/agent-card.json")
 def agent_card():
