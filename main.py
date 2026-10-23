@@ -558,7 +558,7 @@ def build_proposals(batch: dict) -> dict:
 
     policy_revision = str(batch.get("policyRevision", ""))
 
-    def analyze_and_cache(chunk: list[dict]) -> None:
+    def analyze_and_cache(chunk: list[dict], recovery_attempt: int = 0) -> None:
         if not chunk:
             return
         try:
@@ -574,8 +574,8 @@ def build_proposals(batch: dict) -> dict:
                     midpoint,
                     len(chunk) - midpoint,
                 )
-                analyze_and_cache(chunk[:midpoint])
-                analyze_and_cache(chunk[midpoint:])
+                analyze_and_cache(chunk[:midpoint], recovery_attempt)
+                analyze_and_cache(chunk[midpoint:], recovery_attempt)
                 return
             raise
 
@@ -593,11 +593,18 @@ def build_proposals(batch: dict) -> dict:
             )
 
         validated_chunk: dict[str, dict] = {}
+        invalid: set[str] = set()
         by_id = {pkg.get("packageId") or pkg.get("id"): pkg for pkg in chunk}
         for pid in chunk_ids:
             if pid not in generated:
                 continue
-            validated = validate_decision(by_id[pid], generated[pid])
+            try:
+                validated = validate_decision(by_id[pid], generated[pid])
+            except HTTPException as exc:
+                if exc.status_code != 502:
+                    raise
+                invalid.add(pid)
+                continue
             validated_chunk[pid] = {
                 key: value for key, value in validated.items() if key != "packageId"
             }
@@ -615,30 +622,37 @@ def build_proposals(batch: dict) -> dict:
                 )
         decisions.update(validated_chunk)
 
-        if missing:
-            if len(missing) == len(chunk):
-                if len(chunk) == 1:
-                    logger.warning("Model omitted the decision for a single package: package_id=%s", missing[0])
-                    raise HTTPException(
-                        502,
-                        detail={
-                            "code": "INVALID_MODEL_PROPOSAL",
-                            "message": "Model must return exactly one decision for each package in the batch",
-                        },
-                    )
-                midpoint = len(chunk) // 2
+        recovery_ids = [pid for pid in chunk_ids if pid in set(missing) | invalid]
+        if recovery_ids:
+            if recovery_attempt >= 1:
                 logger.warning(
-                    "Model omitted all decisions; splitting batch: left=%s right=%s",
-                    midpoint,
-                    len(chunk) - midpoint,
+                    "Model decision remained invalid after recovery: package_count=%s",
+                    len(recovery_ids),
                 )
-                analyze_and_cache(chunk[:midpoint])
-                analyze_and_cache(chunk[midpoint:])
-                return
+                raise HTTPException(
+                    502,
+                    detail={
+                        "code": "INVALID_MODEL_PROPOSAL",
+                        "message": "Model must return one valid decision for each package in the batch",
+                    },
+                )
 
-            missing_packages = [by_id[pid] for pid in chunk_ids if pid in missing]
-            logger.warning("Recovering omitted model decisions: package_count=%s", len(missing_packages))
-            analyze_and_cache(missing_packages)
+            recovery_packages = [by_id[pid] for pid in recovery_ids]
+            if len(recovery_packages) == len(chunk) and len(chunk) > 1:
+                midpoint = len(recovery_packages) // 2
+                logger.warning(
+                    "Recovering invalid model batch in smaller chunks: left=%s right=%s",
+                    midpoint,
+                    len(recovery_packages) - midpoint,
+                )
+                analyze_and_cache(recovery_packages[:midpoint], recovery_attempt + 1)
+                analyze_and_cache(recovery_packages[midpoint:], recovery_attempt + 1)
+            else:
+                logger.warning(
+                    "Recovering omitted or invalid model decisions: package_count=%s",
+                    len(recovery_packages),
+                )
+                analyze_and_cache(recovery_packages, recovery_attempt + 1)
 
     analyze_and_cache(uncached)
 
