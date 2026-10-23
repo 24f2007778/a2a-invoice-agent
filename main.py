@@ -567,7 +567,7 @@ def build_proposals(batch: dict) -> dict:
         chunk_ids = [pkg.get("packageId") or pkg.get("id") for pkg in chunk]
         missing = sorted(pid for pid in chunk_ids if pid not in generated)
         extra = sorted(set(generated) - set(chunk_ids))
-        if missing or extra:
+        if extra:
             logger.warning("Model decision set mismatch: missing=%s extra=%s", missing, extra)
             raise HTTPException(
                 502,
@@ -580,14 +580,16 @@ def build_proposals(batch: dict) -> dict:
         validated_chunk: dict[str, dict] = {}
         by_id = {pkg.get("packageId") or pkg.get("id"): pkg for pkg in chunk}
         for pid in chunk_ids:
+            if pid not in generated:
+                continue
             validated = validate_decision(by_id[pid], generated[pid])
             validated_chunk[pid] = {
                 key: value for key, value in validated.items() if key != "packageId"
             }
 
-        # Persist only fully validated decisions from this chunk.
+        # Keep valid partial output so recovery never repeats completed model work.
         with engine.begin() as c:
-            for pid in chunk_ids:
+            for pid in validated_chunk:
                 c.execute(
                     text("INSERT INTO decision_cache(package_hash,decision_json,created_at) VALUES(:h,:d,:ts) ON CONFLICT(package_hash) DO NOTHING"),
                     {
@@ -597,6 +599,31 @@ def build_proposals(batch: dict) -> dict:
                     },
                 )
         decisions.update(validated_chunk)
+
+        if missing:
+            if len(missing) == len(chunk):
+                if len(chunk) == 1:
+                    logger.warning("Model omitted the decision for a single package: package_id=%s", missing[0])
+                    raise HTTPException(
+                        502,
+                        detail={
+                            "code": "INVALID_MODEL_PROPOSAL",
+                            "message": "Model must return exactly one decision for each package in the batch",
+                        },
+                    )
+                midpoint = len(chunk) // 2
+                logger.warning(
+                    "Model omitted all decisions; splitting batch: left=%s right=%s",
+                    midpoint,
+                    len(chunk) - midpoint,
+                )
+                analyze_and_cache(chunk[:midpoint])
+                analyze_and_cache(chunk[midpoint:])
+                return
+
+            missing_packages = [by_id[pid] for pid in chunk_ids if pid in missing]
+            logger.warning("Recovering omitted model decisions: package_count=%s", len(missing_packages))
+            analyze_and_cache(missing_packages)
 
     analyze_and_cache(uncached)
 
