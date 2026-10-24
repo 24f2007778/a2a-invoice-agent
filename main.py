@@ -327,7 +327,22 @@ Preserve exact reference spelling. amountMinor is integer minor currency units (
 
             content = response.json()["choices"][0]["message"]["content"]
 
-        parsed = json.loads(content)
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "LLM provider returned invalid JSON; packages=%s response_length=%s",
+                len(packages),
+                len(content),
+            )
+            raise HTTPException(
+                502,
+                detail={
+                    "code": "MODEL_INVALID_RESPONSE",
+                    "message": "The AI provider returned an incomplete or invalid JSON response.",
+                },
+            ) from exc
+
         decisions = parsed.get("decisions", [])
         out: dict[str, dict] = {}
         for decision in decisions:
@@ -564,13 +579,19 @@ def build_proposals(batch: dict) -> dict:
         try:
             generated = model_decisions(chunk, policy_revision)
         except HTTPException as exc:
-            # Split only after a confirmed provider payload-size rejection.
-            # Cache each successful sub-batch independently, so a later 429
-            # does not force completed model work to be repeated on retry.
-            if exc.status_code == 413 and len(chunk) > 1:
+            # Keep successful sub-batches cached so later failures do not repeat completed work.
+            should_split = (
+                exc.status_code == 413
+                or (
+                    exc.status_code == 502
+                    and isinstance(exc.detail, dict)
+                    and exc.detail.get("code") == "MODEL_INVALID_RESPONSE"
+                )
+            )
+            if should_split and len(chunk) > 1:
                 midpoint = len(chunk) // 2
                 logger.warning(
-                    "Splitting oversized batch: left=%s right=%s",
+                    "Splitting model batch after provider rejection: left=%s right=%s",
                     midpoint,
                     len(chunk) - midpoint,
                 )

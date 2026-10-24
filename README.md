@@ -80,7 +80,7 @@ For POSTs, use `Content-Type: application/a2a+json`, `A2A-Version: 1.0`, and `Au
 - The idempotency hash covers recursively sorted compact JSON of `message` only, not `configuration`; message-ID reuse with changed message content returns 409.
 - The decision cache keys by canonical full package content, independent of batch/task/message IDs. New action IDs are generated for each task.
 - Tokens are stored only as SHA-256 principal identifiers, not as raw bearer tokens.
-- The model output is schema-validated. Ambiguous or malformed model output fails closed rather than producing actions.
+- The model output is schema-validated. Provider payload-size rejections and invalid JSON responses are retried in smaller batches; malformed output for a single package fails closed rather than producing actions.
 
 ## Before submitting
 
